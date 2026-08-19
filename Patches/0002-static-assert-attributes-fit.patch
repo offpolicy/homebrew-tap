@@ -1,0 +1,24 @@
+Local patch (not upstream).
+
+PR #1380 adds `strikethrough`, which makes `attribute_type` exactly fill the
+8-bit `attributes` bitfield (SIZE == 8). A ninth attribute would be silently
+truncated, and the symptom would be a rendition that simply never renders --
+not a build error. This turns that into a compile-time failure.
+
+Suggested by a reviewer on the upstream PR:
+https://github.com/mobile-shell/mosh/pull/1380
+
+--- a/src/terminal/terminalframebuffer.h
++++ b/src/terminal/terminalframebuffer.h
+@@ -70,6 +70,11 @@
+   uint64_t background_color : 25;
+   uint64_t attributes : 8;
+ 
++  /* `attributes` is exactly full at SIZE == 8. Widening it to :14 would still
++     fit, since 25 + 25 + 14 == 64 bits. */
++  static_assert( static_cast<int>( SIZE ) <= 8,
++                 "attribute_type outgrew Renditions::attributes; widen the bitfield" );
++
+ public:
+   Renditions( color_type s_background );
+   void set_foreground_color( int num );
