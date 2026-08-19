@@ -1,0 +1,175 @@
+Cursor shape (DECSCUSR, `CSI Ps SP q`) support.
+
+mosh has no dispatch entry for final byte `q` at all, so an application asking
+for a cursor shape is silently ignored -- nvim's insert-mode bar cursor stays a
+block over mosh.
+
+This is upstream PR #1355 rebased onto decd9b7 (it does not apply cleanly: the
+OSC 8 merge added `hyperlink` to the same DrawState::operator== line this
+extends, so the two are combined here), plus a fix for a bug the upstream
+maintainer identified and the author has not addressed:
+
+  https://github.com/mobile-shell/mosh/pull/1355
+  https://github.com/mobile-shell/mosh/issues/352 (open since 2012)
+
+The bug: -1 is the "never set" sentinel, and Framebuffer::reset() (RIS, \033c)
+puts cursor_shape back to it. Upstream's emit is guarded by `!= -1`, so after a
+reset nothing is sent and the terminal keeps whatever shape was last requested
+while our model believes it is default. Repro: printf '\033[6 q\033c'.
+Emitting DECSCUSR 0 on the way back to -1 fixes it.
+
+Style of the added code adjusted to match mosh's clang-format.
+
+diff --git a/src/terminal/terminaldisplay.cc b/src/terminal/terminaldisplay.cc
+index ca2ae86..3f0ead1 100644
+--- a/src/terminal/terminaldisplay.cc
++++ b/src/terminal/terminaldisplay.cc
+@@ -119,6 +119,16 @@ std::string Display::new_frame( bool initialized, const Framebuffer& last, const
+     frame.append( tmp );
+   }
+ 
++  if ( f.ds.cursor_shape != frame.last_frame.ds.cursor_shape ) {
++    /* -1 means "never set", which is also where RIS (\033c) puts us. Upstream
++       PR #1355 skips emitting in that case, so after a reset the terminal keeps
++       whatever shape was last requested while our model believes it is default
++       -- the two ends stay diverged until something else changes the shape.
++       Emitting DECSCUSR 0 (default) on the way back to -1 fixes that. */
++    snprintf( tmp, sizeof( tmp ), "\033[%d q", f.ds.cursor_shape < 0 ? 0 : f.ds.cursor_shape );
++    frame.append( tmp );
++  }
++
+   /* has size changed? */
+   if ( ( !initialized ) || ( f.ds.get_width() != frame.last_frame.ds.get_width() )
+        || ( f.ds.get_height() != frame.last_frame.ds.get_height() ) ) {
+diff --git a/src/terminal/terminalframebuffer.cc b/src/terminal/terminalframebuffer.cc
+index d691b97..ecd25a7 100644
+--- a/src/terminal/terminalframebuffer.cc
++++ b/src/terminal/terminalframebuffer.cc
+@@ -65,9 +65,9 @@ DrawState::DrawState( int s_width, int s_height )
+     combining_char_row( 0 ), default_tabs( true ), tabs( s_width ), scrolling_region_top_row( 0 ),
+     scrolling_region_bottom_row( height - 1 ), renditions( 0 ), hyperlink(), save(), next_print_will_wrap( false ),
+     origin_mode( false ), auto_wrap_mode( true ), insert_mode( false ), cursor_visible( true ),
+-    reverse_video( false ), bracketed_paste( false ), mouse_reporting_mode( MOUSE_REPORTING_NONE ),
+-    mouse_focus_event( false ), mouse_alternate_scroll( false ), mouse_encoding_mode( MOUSE_ENCODING_DEFAULT ),
+-    application_mode_cursor_keys( false )
++    reverse_video( false ), bracketed_paste( false ), cursor_shape( -1 ),
++    mouse_reporting_mode( MOUSE_REPORTING_NONE ), mouse_focus_event( false ), mouse_alternate_scroll( false ),
++    mouse_encoding_mode( MOUSE_ENCODING_DEFAULT ), application_mode_cursor_keys( false )
+ {
+   reinitialize_tabs( 0 );
+ }
+diff --git a/src/terminal/terminalframebuffer.h b/src/terminal/terminalframebuffer.h
+index 5b9c50c..46a24bd 100644
+--- a/src/terminal/terminalframebuffer.h
++++ b/src/terminal/terminalframebuffer.h
+@@ -291,6 +291,8 @@ public:
+ class DrawState
+ {
+ private:
++  static const int cursor_shape_count = 7; /* 0-6 are valid cursor control code */
++
+   int width, height;
+ 
+   void new_grapheme( void );
+@@ -319,6 +321,7 @@ public:
+   bool cursor_visible;
+   bool reverse_video;
+   bool bracketed_paste;
++  int cursor_shape;
+ 
+   enum MouseReportingMode
+   {
+@@ -354,6 +357,12 @@ public:
+   int get_combining_char_row( void ) const { return combining_char_row; }
+   int get_width( void ) const { return width; }
+   int get_height( void ) const { return height; }
++  void set_cursor_shape( int shape )
++  {
++    if ( shape >= 0 && shape < cursor_shape_count ) {
++      cursor_shape = shape;
++    }
++  }
+ 
+   void set_tab( void );
+   void clear_tab( int col );
+@@ -395,7 +404,8 @@ public:
+            && ( reverse_video == x.reverse_video ) && ( renditions == x.renditions )
+            && ( bracketed_paste == x.bracketed_paste ) && ( mouse_reporting_mode == x.mouse_reporting_mode )
+            && ( mouse_focus_event == x.mouse_focus_event ) && ( mouse_alternate_scroll == x.mouse_alternate_scroll )
+-           && ( mouse_encoding_mode == x.mouse_encoding_mode ) && hyperlink == x.hyperlink;
++           && ( mouse_encoding_mode == x.mouse_encoding_mode ) && ( hyperlink == x.hyperlink )
++           && ( cursor_shape == x.cursor_shape );
+   }
+ };
+ 
+diff --git a/src/terminal/terminalfunctions.cc b/src/terminal/terminalfunctions.cc
+index a823fab..c52ce3f 100644
+--- a/src/terminal/terminalfunctions.cc
++++ b/src/terminal/terminalfunctions.cc
+@@ -136,6 +136,16 @@ static Function func_CSI_cursormove_D( CSI, "D", CSI_cursormove );
+ static Function func_CSI_cursormove_H( CSI, "H", CSI_cursormove );
+ static Function func_CSI_cursormove_f( CSI, "f", CSI_cursormove );
+ 
++/* cursor shape */
++static void CSI_cursorshape( Framebuffer* fb, Dispatcher* dispatch )
++{
++  int shape = dispatch->getparam( 0, 0 );
++
++  fb->ds.set_cursor_shape( shape );
++}
++
++static Function func_CSI_cursorshape( CSI, " q", CSI_cursorshape );
++
+ /* device attributes */
+ static void CSI_DA( Framebuffer* fb __attribute( ( unused ) ), Dispatcher* dispatch )
+ {
+diff --git a/src/tests/emulation-cursor-shape.test b/src/tests/emulation-cursor-shape.test
+new file mode 100755
+index 0000000..6fa3d09
+--- /dev/null
++++ b/src/tests/emulation-cursor-shape.test
+@@ -0,0 +1,44 @@
++#!/bin/sh
++
++#
++# This test exercises the cursor shape ascii sequence in Mosh.
++#
++
++# shellcheck source=e2e-test-subrs
++. "$(dirname "$0")/e2e-test-subrs"
++PATH=$PATH:.:$srcdir
++# Top-level wrapper.
++if [ $# -eq 0 ]; then
++    e2e-test "$0" baseline direct verify
++    exit
++fi
++
++# OK, we have arguments, we're one of the test hooks.
++if [ $# -ne 1 ]; then
++    fail "bad arguments %s\n" "$@"
++fi
++
++baseline()
++{
++    while read -r shape sleep_time text; do
++        printf '\n\033[%d q%s' "$shape" "$text"
++        sleep $sleep_time
++    done <<EOF
++0 2 BlinkBlock0
++1 2 BlinkBlock1
++2 2 SteadyBlock
++3 2 BlinkUnderline
++4 2 SteadyUnderline
++5 2 BlinkBar
++6 2 SteadyBar
++0 0 done
++EOF
++    echo
++}
++
++case $1 in
++    baseline|direct)
++        baseline;;
++    *)
++        fail "unknown test argument %s\n" "$1";;
++esac
