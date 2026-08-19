@@ -1,0 +1,75 @@
+Move the local repaint off bare Ctrl-L onto the escape key.
+
+mosh triggers a full client-side repaint on a bare Ctrl-L (0x0C) and ALSO
+forwards the byte to the server. That is hardcoded with no configuration knob.
+
+For anyone using Ctrl-L as a tmux/nvim pane-navigation key (vim-tmux-navigator,
+smart-splits.nvim and friends), every single pane switch therefore re-emits the
+whole screen -- wasted bandwidth on exactly the flaky links mosh exists to
+serve -- and there is no way to ask for a repaint without also sending a
+keystroke to the remote application.
+
+This drops the bare-Ctrl-L trigger and puts the repaint on the escape key
+instead: `Ctrl-^ Ctrl-L`. The escape key is consumed locally and never reaches
+the server, so the binding cannot collide with anything running remotely.
+
+This is upstream PR #522 -- written by a mosh maintainer, open and unmerged
+since 2014-05-18, resolving issue #370 (open since 2013-01-12):
+
+  https://github.com/mobile-shell/mosh/pull/522
+  https://github.com/mobile-shell/mosh/issues/370
+
+Deliberately NOT taken from that PR: it also moves the prediction engine's
+new_user_byte() calls out of the main loop into each branch. That is an
+unrelated change, and a reviewer asking for it to be split out is part of why
+the PR stalled. Escape-key bytes were already being fed to the prediction
+engine before this patch, so omitting it changes nothing.
+
+diff --git a/man/mosh.1 b/man/mosh.1
+index a77a8d3..c08afe0 100644
+--- a/man/mosh.1
++++ b/man/mosh.1
+@@ -288,6 +288,8 @@ for \fBCtrl-B\fP you would type \fBB\fP).
+ 
+ The escape sequence to shut down the connection is
+ \fBEsc .\fP. The sequence \fBEsc Ctrl-Z\fP suspends the client.
++The sequence \fBEsc Ctrl-L\fP redraws the client display locally, without
++sending anything to the server.
+ Any other sequence passes both characters through to the server.
+ 
+ .SH ENVIRONMENT VARIABLES
+diff --git a/src/frontend/stmclient.cc b/src/frontend/stmclient.cc
+index bccab7d..1e259f4 100644
+--- a/src/frontend/stmclient.cc
++++ b/src/frontend/stmclient.cc
+@@ -193,7 +193,8 @@ void STMClient::init( void )
+     tmp = std::string( escape_key_name_buf );
+     std::wstring escape_key_name = std::wstring( tmp.begin(), tmp.end() );
+     escape_key_help
+-      = L"Commands: Ctrl-Z suspends, \".\" quits, " + escape_pass_name + L" gives literal " + escape_key_name;
++      = L"Commands: Ctrl-Z suspends, \".\" quits, Ctrl-L redraws, " + escape_pass_name + L" gives literal "
++        + escape_key_name;
+     overlays.get_notification_engine().set_escape_key_string( tmp );
+   }
+   wchar_t tmp[128];
+@@ -371,6 +372,9 @@ bool STMClient::process_user_input( int fd )
+         /* Emulation sequence to type escape_key is escape_key +
+            escape_pass_key (that is escape key without Ctrl) */
+         net.get_current_state().push_back( Parser::UserByte( escape_key ) );
++      } else if ( the_byte == 0x0C ) { /* escape_key Ctrl-L */
++        /* Repaint the client display locally, sending nothing to the server. */
++        repaint_requested = true;
+       } else {
+         /* Escape key followed by anything other than . and ^ gets sent literally */
+         net.get_current_state().push_back( Parser::UserByte( escape_key ) );
+@@ -397,10 +401,6 @@ bool STMClient::process_user_input( int fd )
+     lf_entered = ( ( the_byte == 0x0A )
+                    || ( the_byte == 0x0D ) ); /* LineFeed, Ctrl-J, '\n' or CarriageReturn, Ctrl-M, '\r' */
+ 
+-    if ( the_byte == 0x0C ) { /* Ctrl-L */
+-      repaint_requested = true;
+-    }
+-
+     net.get_current_state().push_back( Parser::UserByte( the_byte ) );
+   }
+ 
