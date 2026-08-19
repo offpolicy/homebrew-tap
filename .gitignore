@@ -1,0 +1,5 @@
+# Not committed: `brew tap-new` scaffolds CI that is wrong for this tap.
+# autobump.yml would try to bump the formula to a newer upstream version,
+# silently undoing the deliberate pin to the 1.4.0 tarball the patch targets.
+# Bottle-building CI can be added later, intentionally.
+/.github/
