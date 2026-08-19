@@ -1,5 +1,5 @@
 class Mosh < Formula
-  desc "Remote terminal application (patched: faint, strikethrough, cursor shape)"
+  desc "Remote terminal application (patched: faint, strikethrough, cursor shape, escape-key repaint)"
   homepage "https://mosh.org"
   # Built from a PINNED master commit, not the 1.4.0 release tarball.
   #
@@ -20,7 +20,7 @@ class Mosh < Formula
       revision: "decd9b705eb81626f694335b8d5940538beb06da"
   version "1.4.0-decd9b7"
   license "GPL-3.0-or-later"
-  revision 44
+  revision 45
 
   # Patch series, applied in order. Each file is a diff taken straight from the
   # named upstream PR, so refreshing one is `gh pr diff <n> > Patches/<file>`.
@@ -67,6 +67,22 @@ class Mosh < Formula
   # https://github.com/mobile-shell/mosh/issues/352 (open since 2012)
   patch do
     file "Patches/0003-cursor-shape-decscusr.patch"
+  end
+
+  # Move the local repaint off bare Ctrl-L onto the escape key (`Ctrl-^ Ctrl-L`).
+  #
+  # Upstream triggers a full client repaint on a bare Ctrl-L and also forwards the
+  # byte. With Ctrl-L bound to pane navigation in tmux/nvim, every pane switch
+  # re-emits the whole screen, and there is no way to ask for a repaint without
+  # also sending a keystroke to the remote. The escape key is consumed locally and
+  # never reaches the server, so the new binding cannot collide with anything.
+  #
+  # This is PR #522 — written by a mosh maintainer, unmerged since 2014 — minus its
+  # unrelated prediction-engine refactor, which is part of why it stalled in review.
+  # https://github.com/mobile-shell/mosh/pull/522 (open)
+  # https://github.com/mobile-shell/mosh/issues/370 (open since 2013)
+  patch do
+    file "Patches/0004-repaint-on-escape-key.patch"
   end
 
   depends_on "autoconf" => :build # ./autogen.sh -> autoreconf -fi
