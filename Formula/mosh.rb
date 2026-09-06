@@ -20,7 +20,7 @@ class Mosh < Formula
       revision: "decd9b705eb81626f694335b8d5940538beb06da"
   version "1.4.0-decd9b7"
   license "GPL-3.0-or-later"
-  revision 45
+  revision 46
 
   # Patch series, applied in order. Each file is a diff taken straight from the
   # named upstream PR, so refreshing one is `gh pr diff <n> > Patches/<file>`.
@@ -88,16 +88,35 @@ class Mosh < Formula
   depends_on "autoconf" => :build # ./autogen.sh -> autoreconf -fi
   depends_on "automake" => :build
   depends_on "pkgconf" => :build
-  depends_on "protobuf"
 
   uses_from_macos "ncurses"
 
   on_macos do
+    # protobuf.pc `Requires:` the absl_* modules, and Homebrew's build
+    # environment only puts DECLARED dependencies on PKG_CONFIG_PATH. abseil
+    # used to arrive as a recursive runtime dependency of protobuf; now that
+    # protobuf is build-only it has to be named here, or ./configure fails with
+    # "Package 'absl_base', required by 'protobuf', not found".
+    depends_on "abseil" => :build
+
+    # protobuf is BUILD-ONLY on macOS: `install` copies libprotobuf and the
+    # abseil chain it pulls in into this keg and repoints the binaries at those
+    # copies, so nothing under HOMEBREW_PREFIX/opt is referenced at run time.
+    # See the long comment on the dylibbundler call below for why.
+    depends_on "dylibbundler" => :build
+    depends_on "protobuf" => :build
+
     depends_on "tmux" => :build # for `make check`
   end
 
   on_linux do
     depends_on "openssl@3" # Uses CommonCrypto on macOS
+
+    # Linux keeps protobuf as a normal runtime dependency: a distro's soname is
+    # stable for the life of a release, and the bundling below is macOS-only
+    # (dylibbundler and install-name rewriting are Mach-O concepts).
+    depends_on "protobuf"
+
     depends_on "zlib-ng-compat"
   end
 
@@ -121,9 +140,70 @@ class Mosh < Formula
     # `configure` does not recognise `--disable-debug` in `std_configure_args`.
     system "./configure", "--prefix=#{prefix}", "--enable-completion", "--disable-silent-rules"
     system "make", "install"
+
+    # protobuf is the only non-system library these binaries link, and its dylib
+    # filename carries the full version: libprotobuf.36.0.0.dylib became
+    # libprotobuf.36.1.0.dylib on 2026-08-31. dyld matches that filename exactly,
+    # so a protobuf release leaves mosh-client and mosh-server unable to start
+    # ("Library not loaded") until they are rebuilt. protobuf renamed its dylib
+    # 12 times in the 12 months to 2026-09 — roughly monthly.
+    #
+    # Upstream will not change this and considers relinking the packager's job:
+    #   "Mosh requires whatever version of protobuf it was linked against.
+    #    Homebrew is the one doing the linking. If Homebrew upgraded and renamed
+    #    protobuf (or any other library), it needs to relink the executables
+    #    that depend on it."  -- keithw
+    # https://github.com/mobile-shell/mosh/issues/1306 (open since 2024-01-31)
+    #
+    # So carry our own copies. dylibbundler copies libprotobuf, libutf8_validity
+    # and the 79 abseil dylibs behind them into this keg and rewrites the install
+    # names to point there. Afterwards the binaries reference nothing outside the
+    # keg, and protobuf and abseil can be upgraded, or uninstalled, without
+    # touching mosh. The keg grows from 900KB to 8.9MB, which is the whole cost.
+    #
+    # libexec, NOT lib: Homebrew symlinks a keg's lib/* into HOMEBREW_PREFIX/lib,
+    # where every bundled dylib collides with the one abseil and protobuf already
+    # linked there. That makes `brew link` fail outright and leaves mosh
+    # installed but unlinked ("Could not symlink lib/libabsl_base.2608.0.0.dylib").
+    # libexec is never linked into the prefix, which is exactly what private
+    # copies want.
+    #
+    # Absolute path rather than @executable_path: bin/mosh-client is normally
+    # reached through the HOMEBREW_PREFIX/bin symlink, and an absolute install
+    # path sidesteps any question of what @executable_path resolves to for a
+    # symlinked invocation.
+    #
+    # --search-path: libprotobuf reaches libutf8_validity through @rpath, which
+    # dylibbundler resolves only if told where to look.
+    #
+    # dylibbundler ad-hoc signs everything it rewrites unless given -ns, which is
+    # what arm64 wants after an install-name change.
+    if OS.mac?
+      system "dylibbundler", "--bundle-deps", "--create-dir", "--overwrite-files",
+             "--fix-file", bin/"mosh-client",
+             "--fix-file", bin/"mosh-server",
+             "--dest-dir", libexec/"lib",
+             "--install-path", "#{libexec}/lib/",
+             "--search-path", formula_opt_lib("protobuf")
+    end
   end
 
   test do
     system bin/"mosh-client", "-c"
+
+    # The whole point of the bundling above: nothing these binaries load may live
+    # in another formula's keg, so no protobuf or abseil upgrade can leave them
+    # unable to start. References to mosh's own keg are fine and expected --
+    # Homebrew rewrites keg-internal install names through opt/mosh.
+    if OS.mac?
+      ["mosh-client", "mosh-server"].each do |exe|
+        external = shell_output("otool -L #{bin}/#{exe}").lines.drop(1).select do |line|
+          line.include?(HOMEBREW_PREFIX.to_s) &&
+            line.exclude?("#{HOMEBREW_PREFIX}/Cellar/mosh/") &&
+            line.exclude?("#{HOMEBREW_PREFIX}/opt/mosh/")
+        end
+        assert_empty external, "#{exe} links outside its own keg: #{external.join}"
+      end
+    end
   end
 end
