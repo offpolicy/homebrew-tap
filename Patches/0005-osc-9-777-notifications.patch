@@ -1,0 +1,139 @@
+Pass desktop notifications (OSC 9 and OSC 777;notify) through to the client.
+
+mosh-server parses everything into a framebuffer, and an OSC it does not model
+is discarded, so a notification from a remote program never reaches the local
+terminal. This carries the latest one in the framebuffer and has the client
+re-emit it, the same way the bell and the OSC 52 clipboard already travel.
+
+A notification is an event, not state, so it is counted like `bell_count`
+rather than compared by content: the same text twice still arrives twice. RIS
+leaves the count alone, as it does the bell's. Notifications posted between two
+state syncs collapse to the newest one.
+
+Based on upstream PR #1144 (open and conflicting since 2021), without its OSC
+1337 file transfer and with the counter in place of its content comparison,
+which swallowed identical repeats:
+
+  https://github.com/mobile-shell/mosh/pull/1144
+
+Both ends need it. A patched server talking to a stock client is harmless: the
+client's parser drops the unknown OSC.
+
+diff --git a/src/terminal/terminaldisplay.cc b/src/terminal/terminaldisplay.cc
+index 3f0ead1..495216a 100644
+--- a/src/terminal/terminaldisplay.cc
++++ b/src/terminal/terminaldisplay.cc
+@@ -112,6 +112,16 @@ std::string Display::new_frame( bool initialized, const Framebuffer& last, const
+     frame.append( '\007' );
+   }
+ 
++  /* has a notification been posted? */
++  if ( f.get_notification_count() != frame.last_frame.get_notification_count() ) {
++    frame.append( "\033]" );
++    const title_type& notification( f.get_notification() );
++    for ( title_type::const_iterator i = notification.begin(); i != notification.end(); i++ ) {
++      frame.append( *i );
++    }
++    frame.append( '\007' );
++  }
++
+   /* has reverse video state changed? */
+   if ( ( !initialized ) || ( f.ds.reverse_video != frame.last_frame.ds.reverse_video ) ) {
+     /* set reverse video */
+diff --git a/src/terminal/terminalframebuffer.cc b/src/terminal/terminalframebuffer.cc
+index ecd25a7..360cfab 100644
+--- a/src/terminal/terminalframebuffer.cc
++++ b/src/terminal/terminalframebuffer.cc
+@@ -73,7 +73,7 @@ DrawState::DrawState( int s_width, int s_height )
+ }
+ 
+ Framebuffer::Framebuffer( int s_width, int s_height )
+-  : rows(), icon_name(), window_title(), clipboard(), bell_count( 0 ), title_initialized( false ),
++  : rows(), icon_name(), window_title(), clipboard(), notification(), bell_count( 0 ), notification_count( 0 ), title_initialized( false ),
+     ds( s_width, s_height )
+ {
+   assert( s_height > 0 );
+@@ -85,7 +85,8 @@ Framebuffer::Framebuffer( int s_width, int s_height )
+ 
+ Framebuffer::Framebuffer( const Framebuffer& other )
+   : rows( other.rows ), icon_name( other.icon_name ), window_title( other.window_title ),
+-    clipboard( other.clipboard ), bell_count( other.bell_count ), title_initialized( other.title_initialized ),
++    clipboard( other.clipboard ), notification( other.notification ), bell_count( other.bell_count ),
++    notification_count( other.notification_count ), title_initialized( other.title_initialized ),
+     ds( other.ds )
+ {}
+ 
+@@ -96,7 +97,9 @@ Framebuffer& Framebuffer::operator=( const Framebuffer& other )
+     icon_name = other.icon_name;
+     window_title = other.window_title;
+     clipboard = other.clipboard;
++    notification = other.notification;
+     bell_count = other.bell_count;
++    notification_count = other.notification_count;
+     title_initialized = other.title_initialized;
+     ds = other.ds;
+   }
+@@ -388,7 +391,7 @@ void Framebuffer::reset( void )
+   rows = rows_type( height, newrow() );
+   window_title.clear();
+   clipboard.clear();
+-  /* do not reset bell_count */
++  /* do not reset bell_count or notification_count */
+ }
+ 
+ void Framebuffer::soft_reset( void )
+diff --git a/src/terminal/terminalframebuffer.h b/src/terminal/terminalframebuffer.h
+index 46a24bd..f45f757 100644
+--- a/src/terminal/terminalframebuffer.h
++++ b/src/terminal/terminalframebuffer.h
+@@ -433,7 +433,9 @@ private:
+   title_type icon_name;
+   title_type window_title;
+   title_type clipboard;
++  title_type notification;
+   unsigned int bell_count;
++  unsigned int notification_count;
+   bool title_initialized; /* true if the window title has been set via an OSC */
+ 
+   row_pointer newrow( void )
+@@ -517,6 +519,15 @@ public:
+   const title_type& get_icon_name( void ) const { return icon_name; }
+   const title_type& get_window_title( void ) const { return window_title; }
+   const title_type& get_clipboard( void ) const { return clipboard; }
++  /* A notification is an event, not state: count it like the bell so a
++     repeat of the same text is still delivered. */
++  void post_notification( const title_type& s )
++  {
++    notification = s;
++    notification_count++;
++  }
++  const title_type& get_notification( void ) const { return notification; }
++  unsigned int get_notification_count( void ) const { return notification_count; }
+ 
+   void prefix_window_title( const title_type& s );
+ 
+@@ -531,7 +542,8 @@ public:
+   bool operator==( const Framebuffer& x ) const
+   {
+     return ( rows == x.rows ) && ( window_title == x.window_title ) && ( clipboard == x.clipboard )
+-           && ( bell_count == x.bell_count ) && ( ds == x.ds );
++           && ( bell_count == x.bell_count ) && ( notification_count == x.notification_count )
++           && ( notification == x.notification ) && ( ds == x.ds );
+   }
+ };
+ }
+diff --git a/src/terminal/terminalfunctions.cc b/src/terminal/terminalfunctions.cc
+index c52ce3f..18e2d84 100644
+--- a/src/terminal/terminalfunctions.cc
++++ b/src/terminal/terminalfunctions.cc
+@@ -641,6 +641,10 @@ void Dispatcher::OSC_dispatch( const Parser::OSC_End* act __attribute( ( unused
+        && OSC_string[3] == L'c' && OSC_string[4] == L';' ) {
+     Terminal::Framebuffer::title_type clipboard( OSC_string.begin() + 5, OSC_string.end() );
+     fb->set_clipboard( clipboard );
++    /* desktop notifications: OSC 9 (iTerm2/ConEmu) and OSC 777;notify (rxvt) */
++  } else if ( ( OSC_string.size() >= 2 && OSC_string[0] == L'9' && OSC_string[1] == L';' )
++              || ( OSC_string.size() >= 11 && std::equal( OSC_string.begin(), OSC_string.begin() + 11, L"777;notify;" ) ) ) {
++    fb->post_notification( Terminal::Framebuffer::title_type( OSC_string.begin(), OSC_string.end() ) );
+     /* handle osc terminal title sequence */
+   } else if ( OSC_string.size() >= 1 ) {
+     long cmd_num = -1;
