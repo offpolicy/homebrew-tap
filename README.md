@@ -19,6 +19,7 @@ never reaches your real terminal.
 | 0001 | SGR 2 faint/dim + SGR 9 strikethrough | upstream [PR #1380](https://github.com/mobile-shell/mosh/pull/1380), verbatim |
 | 0002 | `static_assert` that `attribute_type` still fits the bitfield | ours |
 | 0003 | Cursor shape (DECSCUSR, `CSI Ps SP q`) | upstream [PR #1355](https://github.com/mobile-shell/mosh/pull/1355), rebased + bugfixed |
+| 0005 | Desktop notifications (OSC 9, OSC 777;notify) | based on upstream [PR #1144](https://github.com/mobile-shell/mosh/pull/1144), reworked |
 
 **0001** — `faint` existed in the `Renditions` enum but `set_rendition()` had no
 `case 2:` and `sgr()` never emitted `";2"`; strikethrough was absent entirely.

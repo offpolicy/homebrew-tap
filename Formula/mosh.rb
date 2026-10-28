@@ -1,5 +1,5 @@
 class Mosh < Formula
-  desc "Remote terminal application (patched: faint, strikethrough, cursor shape, escape-key repaint)"
+  desc "Remote terminal application (patched: faint, strikethrough, cursor shape, escape-key repaint, notifications)"
   homepage "https://mosh.org"
   # Built from a PINNED master commit, not the 1.4.0 release tarball.
   #
@@ -20,7 +20,7 @@ class Mosh < Formula
       revision: "decd9b705eb81626f694335b8d5940538beb06da"
   version "1.4.0-decd9b7"
   license "GPL-3.0-or-later"
-  revision 46
+  revision 47
 
   # Patch series, applied in order. Each file is a diff taken straight from the
   # named upstream PR, so refreshing one is `gh pr diff <n> > Patches/<file>`.
@@ -83,6 +83,19 @@ class Mosh < Formula
   # https://github.com/mobile-shell/mosh/issues/370 (open since 2013)
   patch do
     file "Patches/0004-repaint-on-escape-key.patch"
+  end
+
+  # Desktop notifications (OSC 9, OSC 777;notify). Upstream discards every OSC it
+  # does not model, so a remote program's notification never reaches the local
+  # terminal; this is how Herdr's `[ui.toast] delivery = "terminal"` reaches
+  # Ghostty. Counted like the bell, so a repeated identical notification still
+  # fires; notifications between two state syncs collapse to the newest.
+  #
+  # Based on PR #1144 without its OSC 1337 file transfer, and with that counter in
+  # place of its content comparison, which swallowed identical repeats.
+  # https://github.com/mobile-shell/mosh/pull/1144 (open, conflicting since 2021)
+  patch do
+    file "Patches/0005-osc-9-777-notifications.patch"
   end
 
   depends_on "autoconf" => :build # ./autogen.sh -> autoreconf -fi
