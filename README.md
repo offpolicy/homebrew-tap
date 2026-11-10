@@ -20,6 +20,8 @@ never reaches your real terminal.
 | 0002 | `static_assert` that `attribute_type` still fits the bitfield | ours |
 | 0003 | Cursor shape (DECSCUSR, `CSI Ps SP q`) | upstream [PR #1355](https://github.com/mobile-shell/mosh/pull/1355), rebased + bugfixed |
 | 0005 | Desktop notifications (OSC 9, OSC 777;notify) | based on upstream [PR #1144](https://github.com/mobile-shell/mosh/pull/1144), reworked |
+| 0006 | Synchronized output (DEC mode 2026), server: answer DECRQM, hold half-drawn frames | ours; requested in [#1312](https://github.com/mobile-shell/mosh/issues/1312) |
+| 0007 | Synchronized output, client: bracket each frame written to the local terminal | ours |
 
 **0001** — `faint` existed in the `Renditions` enum but `set_rendition()` had no
 `case 2:` and `sgr()` never emitted `";2"`; strikethrough was absent entirely.
@@ -42,6 +44,25 @@ guarded by `!= -1`, so after a reset the terminal keeps the old shape while mosh
 believes it is default. Repro: `printf '\033[6 q\033c'`. We emit DECSCUSR 0 on
 the way back to `-1`. (Refs [#352](https://github.com/mobile-shell/mosh/issues/352),
 open since 2012.)
+
+**0006** — mosh never answered an application's question about synchronized
+output (DECRQM, `CSI ? 2026 $ p`), so nothing bracketed its redraws, and
+mosh-server's state syncs, which run on their own clock, could land in the
+middle of one. Zellij redraws the whole screen on every `zellij pipe` or
+`zellij action`, even a read-only one, and hides the cursor until the redraw
+ends; agent hooks call those all the time. Over mosh, a sync from the middle of
+a redraw showed as the cursor blinking off for about 100 ms, several times a
+minute. mosh-server now answers for mode 2026 and holds the state it publishes
+while a frame is open: until the frame ends, or 250 ms at most (each new frame
+gets its own 250 ms). Measured on a 146x179 Zellij session over mosh, 30
+forced redraws each: 14 cursor blinks of 108-118 ms with revision 47, none with
+this patch on the server, with either client. Only the server matters here.
+(Refs [#1312](https://github.com/mobile-shell/mosh/issues/1312), no upstream
+implementation.)
+
+**0007** — mosh-client writes a frame in one write, but the local terminal may
+read and draw a large one in pieces. Bracketing every frame with mode 2026 makes
+Ghostty (and any terminal that knows the mode) draw it whole; others ignore it.
 
 ### Built from pinned master, not the 1.4.0 tarball
 

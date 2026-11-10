@@ -1,0 +1,29 @@
+Synchronized output (DEC private mode 2026) from mosh-client.
+
+mosh-client writes each frame to the local terminal in one write, but the
+terminal may read and draw a large one in several pieces. Bracketing every
+frame with CSI ? 2026 h and CSI ? 2026 l makes a terminal that knows the mode
+(Ghostty, kitty, WezTerm, iTerm2, tmux, ...) show it whole. A terminal that
+doesn't know it ignores the private mode.
+
+Client side only, and independent of 0006.
+
+diff --git a/src/frontend/stmclient.cc b/src/frontend/stmclient.cc
+index 1e259f4..5dba978 100644
+--- a/src/frontend/stmclient.cc
++++ b/src/frontend/stmclient.cc
+@@ -287,7 +287,13 @@ void STMClient::output_new_frame( void )
+ 
+   /* calculate minimal difference from where we are */
+   const std::string diff( display.new_frame( !repaint_requested, local_framebuffer, new_state ) );
+-  swrite( STDOUT_FILENO, diff.data(), diff.size() );
++  if ( !diff.empty() ) {
++    /* One frame, drawn whole: bracketed as synchronized output (DEC private mode 2026), the
++       local terminal shows it all at once even when it reads the frame in several pieces.
++       A terminal without the mode ignores the brackets. */
++    const std::string frame = "\033[?2026h" + diff + "\033[?2026l";
++    swrite( STDOUT_FILENO, frame.data(), frame.size() );
++  }
+ 
+   repaint_requested = false;
+ 
