@@ -1,5 +1,5 @@
 class Mosh < Formula
-  desc "Remote terminal application (patched: faint, strikethrough, cursor shape, escape-key repaint, notifications)"
+  desc "Remote terminal application (patched: faint, strikethrough, cursor shape, escape-key repaint, notifications, synchronized output)"
   homepage "https://mosh.org"
   # Built from a PINNED master commit, not the 1.4.0 release tarball.
   #
@@ -20,7 +20,7 @@ class Mosh < Formula
       revision: "decd9b705eb81626f694335b8d5940538beb06da"
   version "1.4.0-decd9b7"
   license "GPL-3.0-or-later"
-  revision 47
+  revision 48
 
   # Patch series, applied in order. Each file is a diff taken straight from the
   # named upstream PR, so refreshing one is `gh pr diff <n> > Patches/<file>`.
@@ -96,6 +96,24 @@ class Mosh < Formula
   # https://github.com/mobile-shell/mosh/pull/1144 (open, conflicting since 2021)
   patch do
     file "Patches/0005-osc-9-777-notifications.patch"
+  end
+
+  # Synchronized output (DEC private mode 2026), server side. mosh never answered an
+  # application's DECRQM query for it, so nothing bracketed its redraws, and a state sync
+  # could land mid-redraw. Zellij redraws the whole screen on every `zellij pipe` or
+  # `zellij action` (agent hooks call those all the time), hiding the cursor until the
+  # redraw ends, so over mosh the cursor blinked off for about 100 ms several times a
+  # minute. mosh-server now answers the query and holds the published state while a
+  # frame is open: until it ends, or 250 ms at most.
+  # https://github.com/mobile-shell/mosh/issues/1312 (open; no upstream implementation)
+  patch do
+    file "Patches/0006-synchronized-output-server.patch"
+  end
+
+  # Synchronized output, client side: mosh-client brackets each frame it writes with
+  # mode 2026, so the local terminal draws a large frame whole. Ours, independent of 0006.
+  patch do
+    file "Patches/0007-synchronized-output-client.patch"
   end
 
   depends_on "autoconf" => :build # ./autogen.sh -> autoreconf -fi

@@ -1,0 +1,281 @@
+Synchronized output (DEC private mode 2026) in mosh-server.
+
+An application brackets a redraw with "begin frame" (CSI ? 2026 h) and "end
+frame" (CSI ? 2026 l) so that the terminal never shows it half drawn, after
+asking whether the terminal supports it (DECRQM, CSI ? 2026 $ p). mosh answered
+nothing, so applications bracketed nothing, and mosh-server's state syncs, which
+run on their own clock, could land in the middle of a redraw.
+
+Zellij shows why that matters. Every `zellij pipe` or `zellij action`, even a
+read-only one, makes it redraw the whole screen: hide the cursor, rewrite every
+cell in many 1 KB writes, show the cursor again. A sync from the middle carries
+"cursor hidden", and the next one, a send interval later, "cursor shown". Over
+mosh the cursor blinked off for about 100 ms several times a minute, whenever an
+agent hook called zellij.
+
+This answers DECRQM for mode 2026, tracks the mode in DrawState, and has
+mosh-server hold the state it publishes while a frame is open. The state goes
+out when the frame ends, or after 250 ms if the application never ends it; each
+new "begin frame" gets its own 250 ms. Other modes stay unanswered, as before.
+The mode is never sent to the client, so DrawState::operator== leaves it out.
+
+Only mosh-server's behaviour changes. A patched server with a stock client is
+fixed in full.
+
+Upstream has no implementation; the feature request is open:
+  https://github.com/mobile-shell/mosh/issues/1312
+
+diff --git a/src/frontend/mosh-server.cc b/src/frontend/mosh-server.cc
+index 5d22553..4ca9027 100644
+--- a/src/frontend/mosh-server.cc
++++ b/src/frontend/mosh-server.cc
+@@ -675,6 +675,68 @@ static int run_server( const char* desired_ip,
+   return 0;
+ }
+ 
++/* Synchronized output (DEC private mode 2026; mosh issue #1312).
++ *
++ * An application brackets a redraw with "begin frame" (CSI ? 2026 h) and "end frame"
++ * (CSI ? 2026 l) so that the terminal never shows it half drawn. mosh-server publishes the
++ * framebuffer to the client on its own schedule, so a publish could land mid-redraw: Zellij
++ * hides the cursor, rewrites the screen in many writes and shows the cursor again, and a
++ * snapshot from the middle reached the client as the cursor vanishing for one send interval.
++ *
++ * While a frame is open the client keeps the last complete state. The new state goes out when
++ * the frame ends, or once the frame has been open for HOLD_MS if the application never ends it.
++ * Each new "begin frame" gets its own HOLD_MS. */
++class FrameHold
++{
++private:
++  static const uint64_t HOLD_MS = 250;
++  bool open;
++  unsigned int begin; /* the "begin frame" being held for */
++  uint64_t since;
++
++public:
++  /* A publish that was held back and still has to go out. */
++  bool pending;
++
++  FrameHold() : open( false ), begin( 0 ), since( 0 ), pending( false ) {}
++
++  /* Whether to hold the terminal's current state back from the client. */
++  bool holds( const Terminal::Complete& terminal, uint64_t now )
++  {
++    const Terminal::DrawState& ds = terminal.get_fb().ds;
++    if ( !ds.synchronized_output ) {
++      open = false;
++      return false;
++    }
++    if ( !open || ds.synchronized_output_begins != begin ) {
++      open = true;
++      begin = ds.synchronized_output_begins;
++      since = now;
++    }
++    return now - since < HOLD_MS;
++  }
++
++  /* Milliseconds until a held state is due anyway. */
++  int wait_time( uint64_t now ) const
++  {
++    if ( !pending || !open ) {
++      return INT_MAX;
++    }
++    return now - since >= HOLD_MS ? 0 : static_cast<int>( since + HOLD_MS - now );
++  }
++};
++
++/* Give the client the terminal's state, unless an open frame holds it back. */
++static void publish( ServerConnection& network, Terminal::Complete& terminal, FrameHold& hold, uint64_t now )
++{
++  if ( hold.holds( terminal, now ) ) {
++    hold.pending = true;
++  } else {
++    network.set_current_state( terminal );
++    hold.pending = false;
++  }
++}
++
+ static void serve( int host_fd,
+                    int pipe_fd,
+                    Terminal::Complete& terminal,
+@@ -711,6 +773,7 @@ static void serve( int host_fd,
+ #endif
+ 
+   bool child_released = false;
++  FrameHold hold;
+ 
+   while ( true ) {
+     try {
+@@ -720,6 +783,7 @@ static void serve( int host_fd,
+ 
+       timeout = std::min( timeout, network.wait_time() );
+       timeout = std::min( timeout, terminal.wait_time( now ) );
++      timeout = std::min( timeout, hold.wait_time( now ) );
+       if ( ( !network.get_remote_state_num() ) || network.shutdown_in_progress() ) {
+         timeout = std::min( timeout, 5000 );
+       }
+@@ -803,7 +867,7 @@ static void serve( int host_fd,
+ 
+           /* update client with new state of terminal */
+           if ( !network.shutdown_in_progress() ) {
+-            network.set_current_state( terminal );
++            publish( network, terminal, hold, now );
+           }
+ #if defined( HAVE_SYSLOG ) || defined( HAVE_UTEMPTER )
+ #ifdef HAVE_UTEMPTER
+@@ -874,7 +938,7 @@ static void serve( int host_fd,
+           terminal_to_host += terminal.act( std::string( buf, bytes_read ) );
+ 
+           /* update client with new state of terminal */
+-          network.set_current_state( terminal );
++          publish( network, terminal, hold, now );
+         }
+       }
+ 
+@@ -937,7 +1001,10 @@ static void serve( int host_fd,
+ 
+       if ( terminal.set_echo_ack( now ) && !network.shutdown_in_progress() ) {
+         /* update client with new echo ack */
+-        network.set_current_state( terminal );
++        publish( network, terminal, hold, now );
++      } else if ( hold.pending && !network.shutdown_in_progress() ) {
++        /* a held state whose frame ended without new output, or outlived the hold */
++        publish( network, terminal, hold, now );
+       }
+ 
+       if ( !network.get_remote_state_num() && time_since_remote_state >= timeout_if_no_client ) {
+diff --git a/src/terminal/terminalframebuffer.cc b/src/terminal/terminalframebuffer.cc
+index 360cfab..255160c 100644
+--- a/src/terminal/terminalframebuffer.cc
++++ b/src/terminal/terminalframebuffer.cc
+@@ -66,6 +66,7 @@ DrawState::DrawState( int s_width, int s_height )
+     scrolling_region_bottom_row( height - 1 ), renditions( 0 ), hyperlink(), save(), next_print_will_wrap( false ),
+     origin_mode( false ), auto_wrap_mode( true ), insert_mode( false ), cursor_visible( true ),
+     reverse_video( false ), bracketed_paste( false ), cursor_shape( -1 ),
++    synchronized_output( false ), synchronized_output_begins( 0 ),
+     mouse_reporting_mode( MOUSE_REPORTING_NONE ), mouse_focus_event( false ), mouse_alternate_scroll( false ),
+     mouse_encoding_mode( MOUSE_ENCODING_DEFAULT ), application_mode_cursor_keys( false )
+ {
+diff --git a/src/terminal/terminalframebuffer.h b/src/terminal/terminalframebuffer.h
+index f45f757..7936ab8 100644
+--- a/src/terminal/terminalframebuffer.h
++++ b/src/terminal/terminalframebuffer.h
+@@ -323,6 +323,14 @@ public:
+   bool bracketed_paste;
+   int cursor_shape;
+ 
++  /* Synchronized output (DEC private mode 2026): the application is between "begin frame"
++     (CSI ? 2026 h) and "end frame" (CSI ? 2026 l). mosh-server reads it to keep a half-drawn
++     screen from the client. It is never sent to the client, so operator== leaves it out. */
++  bool synchronized_output;
++  /* Counts "begin frame"s, so a new frame re-arms mosh-server's hold even when the last one
++     was never closed. */
++  unsigned int synchronized_output_begins;
++
+   enum MouseReportingMode
+   {
+     MOUSE_REPORTING_NONE = 0,
+diff --git a/src/terminal/terminalfunctions.cc b/src/terminal/terminalfunctions.cc
+index 18e2d84..4efd1a1 100644
+--- a/src/terminal/terminalfunctions.cc
++++ b/src/terminal/terminalfunctions.cc
+@@ -339,6 +339,9 @@ static void CSI_DECSM( Framebuffer* fb, Dispatcher* dispatch )
+       fb->ds.mouse_reporting_mode = (Terminal::DrawState::MouseReportingMode)param;
+     } else if ( param == 1005 || param == 1006 || param == 1015 ) {
+       fb->ds.mouse_encoding_mode = (Terminal::DrawState::MouseEncodingMode)param;
++    } else if ( param == 2026 ) { /* synchronized output: begin frame */
++      fb->ds.synchronized_output = true;
++      fb->ds.synchronized_output_begins++;
+     } else {
+       set_if_available( get_DEC_mode( param, fb ), true );
+     }
+@@ -354,6 +357,8 @@ static void CSI_DECRM( Framebuffer* fb, Dispatcher* dispatch )
+       fb->ds.mouse_reporting_mode = Terminal::DrawState::MOUSE_REPORTING_NONE;
+     } else if ( param == 1005 || param == 1006 || param == 1015 ) {
+       fb->ds.mouse_encoding_mode = Terminal::DrawState::MOUSE_ENCODING_DEFAULT;
++    } else if ( param == 2026 ) { /* synchronized output: end frame */
++      fb->ds.synchronized_output = false;
+     } else {
+       set_if_available( get_DEC_mode( param, fb ), false );
+     }
+@@ -364,6 +369,19 @@ static void CSI_DECRM( Framebuffer* fb, Dispatcher* dispatch )
+ static Function func_CSI_DECSM( CSI, "?h", CSI_DECSM, false );
+ static Function func_CSI_DECRM( CSI, "?l", CSI_DECRM, false );
+ 
++/* Request DEC private mode (DECRQM, CSI ? Ps $ p), answered for synchronized output only.
++   Applications such as Zellij ask before they bracket a redraw with mode 2026, and bracket
++   nothing when no answer comes. Every other mode stays unanswered, as before. */
++static void CSI_DECRQM( Framebuffer* fb, Dispatcher* dispatch )
++{
++  if ( dispatch->getparam( 0, 0 ) == 2026 ) {
++    /* 1: set, 2: reset */
++    dispatch->terminal_to_host.append( fb->ds.synchronized_output ? "\033[?2026;1$y" : "\033[?2026;2$y" );
++  }
++}
++
++static Function func_CSI_DECRQM( CSI, "?$p", CSI_DECRQM, false );
++
+ static bool* get_ANSI_mode( int param, Framebuffer* fb )
+ {
+   if ( param == 4 ) { /* insert/replace mode */
+diff --git a/src/tests/Makefile.am b/src/tests/Makefile.am
+index c7d124e..6a2bf81 100644
+--- a/src/tests/Makefile.am
++++ b/src/tests/Makefile.am
+@@ -24,6 +24,7 @@ displaytests = \
+ 	emulation-attributes-osc8.test \
+ 	emulation-back-tab.test \
+ 	emulation-cursor-motion.test \
++	emulation-synchronized-output.test \
+ 	emulation-multiline-scroll.test \
+ 	emulation-scroll.test \
+ 	emulation-wrap-across-frames.test \
+diff --git a/src/tests/emulation-synchronized-output.test b/src/tests/emulation-synchronized-output.test
+new file mode 100755
+index 0000000..f88c617
+--- /dev/null
++++ b/src/tests/emulation-synchronized-output.test
+@@ -0,0 +1,43 @@
++#!/bin/sh
++
++#
++# Synchronized output (DEC private mode 2026): everything drawn inside a frame reaches the
++# client, both when the application ends the frame and when it never does (mosh-server
++# publishes a frame that stays open past its hold).
++#
++
++# shellcheck source=e2e-test-subrs
++. "$(dirname "$0")/e2e-test-subrs"
++PATH=$PATH:.:$srcdir
++# Top-level wrapper.
++if [ $# -eq 0 ]; then
++    e2e-test "$0" baseline direct verify
++    exit
++fi
++
++# OK, we have arguments, we're one of the test hooks.
++if [ $# -ne 1 ]; then
++    fail "bad arguments %s\n" "$@"
++fi
++
++baseline()
++{
++    printf '\033[H\033[J'
++    # Frames the application ends, drawn in two writes each.
++    for row in 1 2 3; do
++        printf '\033[?2026h\033[%d;1Hframe %d' "$row" "$row"
++        sleepf
++        printf ' ended\033[?2026l'
++        sleepf
++    done
++    # A frame never ended: its contents still arrive, once mosh-server's hold runs out.
++    printf '\033[?2026h\033[5;1Hframe never ended'
++    sleep 2
++}
++
++case $1 in
++    baseline|direct)
++        baseline;;
++    *)
++        fail "unknown test argument %s\n" "$1";;
++esac
